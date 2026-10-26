@@ -44,7 +44,6 @@ from litellm.types.llms.openai import (
     ChatCompletionFileObject,
     ChatCompletionFileObjectFile,
     ChatCompletionImageObject,
-    ChatCompletionImageUrlObject,
     OpenAIChatCompletionChoices,
     OpenAIMessageContentListBlock,
 )
@@ -294,9 +293,8 @@ class OpenAIGPTConfig(BaseLLMModelInfo, BaseConfig):
                     "url": content_item["image_url"],
                 }
             elif isinstance(content_item["image_url"], dict):
-                new_image_url_obj: Final = ChatCompletionImageUrlObject(
-                    **{k: v for k, v in content_item["image_url"].items() if k not in litellm_specific_params}
-                )
+                new_image_url_obj: Final = content_item["image_url"].copy()
+                new_image_url_obj.pop("format", None)
                 content_item["image_url"] = new_image_url_obj
         elif content_item.get("type") == "file":
             content_item = cast(ChatCompletionFileObject, content_item)

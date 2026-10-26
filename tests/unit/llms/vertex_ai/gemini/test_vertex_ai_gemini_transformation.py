@@ -1,8 +1,8 @@
 import base64
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from itertools import chain
 from pathlib import Path
-from typing import Final, Literal
+from typing import Final, Literal, cast
 
 import httpx
 import pytest
@@ -19,8 +19,160 @@ from litellm.llms.vertex_ai.gemini.transformation import (
     gemini_convert_messages_with_history,
     transform_request_body,
 )
+from litellm.responses.litellm_completion_transformation.transformation import LiteLLMCompletionResponsesConfig
+from litellm.types.llms.openai import AllMessageValues
 from litellm.types.llms.vertex_ai import BlobType, ContentType, PartType
 from litellm.types.utils import Message
+
+
+def _responses_tool_media_history(content: Mapping[str, object]) -> list[AllMessageValues]:
+    output: Final = (
+        LiteLLMCompletionResponsesConfig._transform_responses_api_tool_call_output_to_chat_completion_message(
+            {
+                "call_id": "call_media",
+                "output": [{"type": "input_text", "text": '{"ok":true}'}, content],
+            }
+        )
+    )
+    return [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {"id": "call_media", "type": "function", "function": {"name": "get_media", "arguments": "{}"}}
+            ],
+        },
+        *cast(list[AllMessageValues], output),
+    ]
+
+
+@pytest.mark.parametrize("role", ["user", "assistant", "tool"])
+def test_responses_media_reaches_each_gemini_role(role: str) -> None:
+    parts: Final = [
+        {"type": "input_text", "text": '{"ok":true}'},
+        {"type": "input_image", "image_url": "aW1hZ2U=", "format": "image/png", "detail": "high"},
+        {"type": "input_audio", "input_audio": {"data": "c291bmQ=", "format": "wav"}},
+        {"type": "input_file", "file_data": "cGRm", "format": "application/pdf"},
+    ]
+    input_items: Final = (
+        [
+            {"type": "function_call", "call_id": "call_media", "name": "get_media", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_media", "output": parts},
+        ]
+        if role == "tool"
+        else [{"role": role, "content": parts}]
+    )
+    messages: Final = LiteLLMCompletionResponsesConfig.transform_responses_api_input_to_messages(input_items, {})
+    result: Final = gemini_convert_messages_with_history(
+        messages, model="gemini-3.8-flash", custom_llm_provider="gemini"
+    )
+    media: Final = [
+        {"inline_data": {"data": "aW1hZ2U=", "mime_type": "image/png"}},
+        {"inline_data": {"data": "c291bmQ=", "mime_type": "audio/wav"}},
+        {"inline_data": {"data": "cGRm", "mime_type": "application/pdf"}},
+    ]
+    assert result[-1] == (
+        {
+            "role": "user",
+            "parts": [
+                {
+                    "function_response": {
+                        "id": "call_media",
+                        "name": "get_media",
+                        "response": {"ok": True},
+                        "parts": media,
+                    }
+                }
+            ],
+        }
+        if role == "tool"
+        else {
+            "role": "model" if role == "assistant" else "user",
+            "parts": [
+                {"text": '{"ok":true}'},
+                {**media[0], "media_resolution": {"level": "MEDIA_RESOLUTION_HIGH"}},
+                *media[1:],
+            ],
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    ("provider", "model", "uri", "mime", "nested", "error"),
+    [
+        (
+            "gemini",
+            "gemini-2.5-flash",
+            "https://generativelanguage.googleapis.com/v1beta/files/clip",
+            None,
+            False,
+            None,
+        ),
+        (
+            "gemini",
+            "gemini-3.8-flash",
+            "https://generativelanguage.googleapis.com/v1beta/files/clip",
+            None,
+            True,
+            "inline media",
+        ),
+        ("gemini", "gemini-3.8-flash", "gs://media-test/clip.mp4", None, True, "inline media"),
+        ("vertex_ai", "gemini-2.5-flash", "gs://media-test/clip.mp4", None, False, None),
+        ("vertex_ai", "gemini-3.8-flash", "gs://media-test/clip.mp4", None, True, None),
+        (
+            "vertex_ai",
+            "gemini-3.8-flash",
+            "https://generativelanguage.googleapis.com/v1beta/files/clip",
+            None,
+            True,
+            "MIME type",
+        ),
+        ("vertex_ai", "gemini-3.8-flash", "gs://media-test/extensionless", "video/mp4", True, None),
+        (
+            "vertex_ai_beta",
+            "gemini-3.8-flash",
+            "https://generativelanguage.googleapis.com/v1beta/files/clip",
+            "video/mp4",
+            True,
+            None,
+        ),
+        ("vertex_ai", "gemini-3.8-flash", "https://media.example/clip", "video/mp4", True, None),
+    ],
+)
+def test_tool_uri_policy_follows_provider_and_model_placement(
+    provider: str, model: str, uri: str, mime: str | None, nested: bool, error: str | None
+) -> None:
+    messages: Final = _responses_tool_media_history(
+        {"type": "input_file", "file_url": uri, "video_metadata": {"fps": 2}, **({"format": mime} if mime else {})}
+    )
+    if error:
+        with pytest.raises(litellm.BadRequestError, match=error):
+            gemini_convert_messages_with_history(messages, model=model, custom_llm_provider=provider)
+        return
+    result: Final = gemini_convert_messages_with_history(messages, model=model, custom_llm_provider=provider)
+    file: Final = {
+        "file_data": {"file_uri": uri, **({"mime_type": "video/mp4"} if provider.startswith("vertex") else {})}
+    }
+    response: Final = {"name": "get_media", "response": {"ok": True}}
+    # Checked 2026-10-26: https://cloud.google.com/vertex-ai/generative-ai/docs/reference/rest/v1/Content#FunctionResponsePart
+    assert result[-1]["parts"] == (
+        [{"function_response": {**response, "id": "call_media", "parts": [file]}}]
+        if nested
+        else [{"function_response": response}, {**file, "video_metadata": {"fps": 2}}]
+    )
+
+
+@pytest.mark.parametrize("role", ["user", "assistant"])
+def test_history_preserves_role_specific_priority_for_conflicting_file_sources(role: str) -> None:
+    file: Final = {"file_id": "gs://media-test/sound.wav", "file_data": "data:audio/wav;base64,c291bmQ="}
+    messages: Final = cast(list[AllMessageValues], [{"role": role, "content": [{"type": "file", "file": file}]}])
+    part: Final = (
+        {"file_data": {"file_uri": file["file_id"], "mime_type": "audio/wav"}}
+        if role == "user"
+        else {"inline_data": {"data": "c291bmQ=", "mime_type": "audio/wav"}}
+    )
+    assert gemini_convert_messages_with_history(messages) == [
+        {"role": "user" if role == "user" else "model", "parts": [part, {"text": " "}] if role == "user" else [part]}
+    ]
 
 
 def test_check_if_part_exists_in_parts():
@@ -59,13 +211,9 @@ def test_check_if_part_exists_in_parts_camel_case_snake_case():
     assert check_if_part_exists_in_parts(parts_with_snake_case, part_with_camel_case)
 
     # Test camelCase to snake_case matching
-    parts_with_camel_case = [
-        {"functionCall": {"name": "calculate_sum", "args": {"a": 1, "b": 2}}}
-    ]
+    parts_with_camel_case = [{"functionCall": {"name": "calculate_sum", "args": {"a": 1, "b": 2}}}]
 
-    part_with_snake_case = {
-        "function_call": {"name": "calculate_sum", "args": {"a": 1, "b": 2}}
-    }
+    part_with_snake_case = {"function_call": {"name": "calculate_sum", "args": {"a": 1, "b": 2}}}
 
     # Should find match between functionCall and function_call
     assert check_if_part_exists_in_parts(parts_with_camel_case, part_with_snake_case)
@@ -1321,20 +1469,19 @@ class TestMediaResolution:
         ]
         assert _extract_max_media_resolution_from_messages(messages) is None
 
-    def test_transform_request_body_gemini_2x_adds_media_resolution(self):
+    @pytest.mark.parametrize("part", [
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo=", "detail": "high"}},
+        {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo=", "detail": "high"},
+        {"type": "input_file", "file_data": "data:application/pdf;base64,cGRm", "detail": "high"},
+    ])
+    def test_transform_request_body_gemini_2x_adds_media_resolution(self, part):
         """Test that media_resolution is added to generationConfig for Gemini 2.x models"""
         messages = [
             {
                 "role": "user",
                 "content": [
                     {"type": "text", "text": "What is this?"},
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": "data:image/png;base64,iVBORw0KGgo=",
-                            "detail": "high",
-                        },
-                    },
+                    part,
                 ],
             }
         ]
@@ -1453,7 +1600,7 @@ class TestMediaResolution:
                     {
                         "type": "file",
                         "file": {
-                            "url": "data:image/png;base64,abc123",
+                            "file_data": "data:image/png;base64,abc123",
                             "detail": "high",
                         },
                     },
@@ -1479,7 +1626,7 @@ class TestMediaResolution:
                     {
                         "type": "file",
                         "file": {
-                            "url": "data:image/png;base64,def456",
+                            "file_data": "data:image/png;base64,def456",
                             "detail": "high",
                         },
                     },
