@@ -8,6 +8,8 @@ description: Add database queries, extract existing Prisma calls into repositori
 ## Adding new database access
 
 - Put Python database access behind an operation in `litellm/repositories`
+- Routes obtain the database through `DatabaseDependency` from `litellm.proxy.deps`, never the `prisma_client` global
+- Feature providers build repositories from `litellm.repositories.database.Database`, such as `UserBannerRepository(database.prisma)`
 - Give callers typed inputs and outputs, not Prisma clients, models, or query dictionaries
 - Keep query execution and backend selection inside the repository
 - Prisma is fine for the implementation, adding a query does not require a Rust port
